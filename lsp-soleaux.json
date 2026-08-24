@@ -1,0 +1,19 @@
+{
+  "servers": [
+    {
+      "extensions": ["py", "pyi"],
+      "command": ["npx", "--yes", "--package", "pyright", "pyright-langserver", "--stdio"],
+      "rootDir": "."
+    },
+    {
+      "extensions": ["js", "ts", "jsx", "tsx", "mjs", "cjs", "mts", "cts"],
+      "command": ["npx", "--", "typescript-language-server", "--stdio"],
+      "rootDir": "."
+    },
+    {
+      "extensions": ["rs"],
+      "command": ["rustup", "run", "stable", "rust-analyzer"],
+      "rootDir": "analysis-sidecar"
+    }
+  ]
+}
