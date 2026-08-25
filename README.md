@@ -30,6 +30,7 @@ node oxc-sidecar/bin/ast-soleaux-oxc.mjs --version
 node oxc-sidecar/bin/ast-soleaux-typescript-project.mjs --version-json
 cargo build --manifest-path analysis-sidecar/Cargo.toml
 cargo test --manifest-path analysis-sidecar/Cargo.toml
+npm ci --prefix execution-sidecar
 python execution-sidecar/ast_soleaux_typescript_sandbox.py --version-json
 npm ci --prefix postgresql-sidecar
 node postgresql-sidecar/bin/ast-soleaux-postgresql.mjs --version-json
@@ -240,6 +241,8 @@ uv sync --locked --all-extras --dev --no-python-downloads
 npm ci --prefix oxc-sidecar
 npm run format:check --prefix oxc-sidecar
 npm test --prefix oxc-sidecar
+npm ci --prefix execution-sidecar
+uv run --no-sync python execution-sidecar/ast_soleaux_typescript_sandbox.py --version-json
 uv lock --check
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
@@ -259,11 +262,11 @@ uv run --no-sync check-wheel-contents dist/*.whl
 uv run --no-sync python tests/package_smoke.py dist/ast_soleaux-0.5.0-py3-none-any.whl dist/ast_soleaux-0.5.0.tar.gz 0.5.0
 ```
 
-Passing every relevant pytest test is the functional acceptance criterion; the collected-test count is informational rather than an expected value. The default `-ra` summary makes every non-passing outcome visible. Pytest-cov reports statement coverage for `ast_soleaux` as diagnostic evidence only and does not override the test result. Integration acceptance requires an explicit executable reporting exactly ast-grep 0.45.0, the pinned Oxc sidecar dependencies installed under `oxc-sidecar`, and both modern `mode="auto"` and handshake-era `mode="legacy"` MCP connections.
+Passing every relevant pytest test is the functional acceptance criterion; the collected-test count is informational rather than an expected value. The default `-ra` summary makes every non-passing outcome visible. Pytest-cov reports statement coverage for `ast_soleaux` as diagnostic evidence only and does not override the test result. Integration acceptance requires an explicit executable reporting exactly ast-grep 0.45.0, the pinned Oxc and TypeScript execution dependencies installed under their sidecar directories, and both modern `mode="auto"` and handshake-era `mode="legacy"` MCP connections.
 
 Those commands describe one platform. Acceptance runs on Linux, macOS, and Windows, and path traversal, permissions, and process teardown behave differently on each: inode numbers are reused on Linux and unstable on Windows, and `chmod` sets only the read-only flag on Windows. Type-check the other platforms with `mypy --platform` and `pyright --pythonplatform`, and run the affected tests on Linux in a container before pushing. The path-scoped rules in `.claude/rules/cross-platform-verification.md`, `.claude/rules/filesystem-portability.md`, and `.claude/rules/linux-testing.md` carry the platform-specific commands and assertions.
 
-Distribution verification stays in the repository-owned locked environment: tool execution disables synchronization, builds disable PEP 517 isolation, the wheel is imported directly from its archive, and the sdist is inspected without extraction or installation. The separately installed Oxc sidecar manifest, lockfile, executable, and tests ship in the sdist rather than the pure-Python wheel.
+Distribution verification stays in the repository-owned locked environment: tool execution disables synchronization, builds disable PEP 517 isolation, the wheel is imported directly from its archive, and the sdist is inspected without extraction or installation. The separately installed Oxc and TypeScript execution sidecar manifests, lockfiles, helpers, and tests ship in the sdist rather than the pure-Python wheel.
 
 CI synchronizes the locked repository environment once and runs every subsequent Python tool with `uv run --no-sync`. `scripts/launch_server.py` is a thin repository entrypoint to the same server used by the packaged console script.
 

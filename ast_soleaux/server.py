@@ -57,6 +57,9 @@ from ast_soleaux.worker import (
 
 DEFAULT_MAX_RESULTS: Final = 50
 HARD_MAX_RESULTS: Final = 500
+DEFAULT_PAGE_OUTPUT_BYTES: Final = 32 * 1024
+MIN_PAGE_OUTPUT_BYTES: Final = 1024
+PAGE_ENVELOPE_RESERVE_BYTES: Final = 1024
 DEFAULT_COMMAND_TIMEOUT_SECONDS: Final = 30.0
 FALLBACK_SERVER_VERSION: Final = "0+unknown"
 NEUTRAL_AST_GREP_CONFIG: Final = "ruleDirs: []\n"
@@ -137,6 +140,8 @@ BUILTIN_LANGUAGE_IDS: Final = (
 
 DumpFormat = Literal["pattern", "cst", "ast", "sexp"]
 OutputFormat = Literal["text", "json"]
+SearchDetail = Literal["full", "captures", "locations"]
+OutlineDetail = Literal["full", "symbols"]
 Strictness = Literal["cst", "smart", "ast", "relaxed", "signature", "template"]
 OutlineItemsMode = Literal["auto", "structure", "exports", "imports", "all"]
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
@@ -196,6 +201,7 @@ class SearchResults(TypedDict):
     limit: int
     next_cursor: NotRequired[str | None]
     snapshot_truncated: NotRequired[bool]
+    output_bytes: NotRequired[int]
     diagnostics: NotRequired[JsonObject]
 
 
@@ -219,6 +225,9 @@ class OutlineResults(TypedDict):
     returned: int
     truncated: bool
     limit: int
+    next_cursor: NotRequired[str | None]
+    snapshot_truncated: NotRequired[bool]
+    output_bytes: NotRequired[int]
     resolved_paths: NotRequired[list[str]]
     path_errors: NotRequired[list[OutlinePathError]]
 
@@ -534,6 +543,36 @@ class ResultCursorStore:
             oldest = min(self._search, key=lambda token: self._search[token].expires_at)
             self._search.pop(oldest, None)
 
+    @staticmethod
+    def _page(
+        matches: Sequence[JsonObject],
+        *,
+        start: int,
+        page_size: int,
+        max_output_bytes: int | None,
+    ) -> tuple[list[JsonObject], int]:
+        if max_output_bytes is None:
+            end = min(start + page_size, len(matches))
+            return list(matches[start:end]), end
+        available = max_output_bytes - PAGE_ENVELOPE_RESERVE_BYTES
+        if available <= 0:
+            raise ValueError("max_output_bytes is too small for the structured result envelope")
+        page: list[JsonObject] = []
+        encoded_bytes = 2
+        end = start
+        while end < len(matches) and len(page) < page_size:
+            item = matches[end]
+            item_bytes = len(json.dumps(item, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+            additional = item_bytes + (1 if page else 0)
+            if encoded_bytes + additional > available:
+                if not page:
+                    raise ValueError("one result record exceeds max_output_bytes; use a compact detail mode or narrow the query")
+                break
+            page.append(item)
+            encoded_bytes += additional
+            end += 1
+        return page, end
+
     def first_search_page(
         self,
         *,
@@ -542,10 +581,16 @@ class ResultCursorStore:
         page_size: int,
         source_truncated: bool,
         metadata: JsonObject | None = None,
+        max_output_bytes: int | None = None,
     ) -> CursorPage:
         self._prune()
-        page = matches[:page_size]
-        remaining = len(matches) > page_size
+        page, end = self._page(
+            matches,
+            start=0,
+            page_size=page_size,
+            max_output_bytes=max_output_bytes,
+        )
+        remaining = end < len(matches)
         next_cursor: str | None = None
         page_metadata = dict(metadata) if metadata is not None else None
         if remaining:
@@ -553,7 +598,7 @@ class ResultCursorStore:
             self._search[next_cursor] = SearchCursorSnapshot(
                 query_digest=query_digest,
                 matches=matches,
-                offset=page_size,
+                offset=end,
                 expires_at=time.monotonic() + CURSOR_TTL_SECONDS,
                 source_truncated=source_truncated,
                 metadata=page_metadata,
@@ -576,6 +621,7 @@ class ResultCursorStore:
         cursor: str,
         query_digest: str,
         page_size: int,
+        max_output_bytes: int | None = None,
     ) -> CursorPage:
         self._prune()
         snapshot = self._search.get(cursor)
@@ -583,9 +629,12 @@ class ResultCursorStore:
             raise ValueError("cursor is invalid or expired")
         if snapshot.query_digest != query_digest:
             raise ValueError("cursor does not match this search query")
-        start = snapshot.offset
-        end = min(start + page_size, len(snapshot.matches))
-        page = snapshot.matches[start:end]
+        page, end = self._page(
+            snapshot.matches,
+            start=snapshot.offset,
+            page_size=page_size,
+            max_output_bytes=max_output_bytes,
+        )
         snapshot.offset = end
         snapshot.expires_at = time.monotonic() + CURSOR_TTL_SECONDS
         has_more = end < len(snapshot.matches)
@@ -2326,6 +2375,70 @@ def run_outline_process(
     return result.records, result.observed_extra
 
 
+def _set_output_bytes(result: JsonObject) -> int:
+    output_bytes = 0
+    for _attempt in range(4):
+        result["output_bytes"] = output_bytes
+        measured = len(json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        if measured == output_bytes:
+            return measured
+        output_bytes = measured
+    result["output_bytes"] = output_bytes
+    return output_bytes
+
+
+def _capture_text_record(value: object) -> JsonObject | None:
+    mapping = string_object_dict(value)
+    if mapping is None:
+        return None
+    text = mapping.get("text")
+    if not isinstance(text, str):
+        return None
+    return {"text": text}
+
+
+def _compact_source_range(value: object) -> JsonObject | None:
+    mapping = string_object_dict(value)
+    if mapping is None:
+        return None
+    compact: JsonObject = {}
+    for endpoint in ("start", "end"):
+        endpoint_mapping = string_object_dict(mapping.get(endpoint))
+        if endpoint_mapping is None:
+            continue
+        compact[endpoint] = {key: item for key in ("line", "column") if isinstance((item := endpoint_mapping.get(key)), int)}
+    return compact
+
+
+def project_search_match(match: Mapping[str, JsonValue], detail: SearchDetail) -> JsonObject:
+    if detail == "full":
+        return JSON_OBJECT_ADAPTER.validate_python(dict(match), strict=True)
+    projected: JsonObject = {}
+    for key in ("file", "language", "ruleId"):
+        if key in match:
+            projected[key] = JSON_VALUE_ADAPTER.validate_python(match[key], strict=True)
+    compact_range = _compact_source_range(match.get("range"))
+    if compact_range is not None:
+        projected["range"] = compact_range
+    if detail == "captures":
+        meta = string_object_dict(match.get("metaVariables"))
+        if meta is not None:
+            captures: JsonObject = {"single": {}, "multi": {}}
+            single = string_object_dict(meta.get("single")) or {}
+            captures["single"] = {name: capture for name, value in single.items() if (capture := _capture_text_record(value)) is not None}
+            multi = string_object_dict(meta.get("multi")) or {}
+            projected_multi: JsonObject = {}
+            for name, values in multi.items():
+                if not isinstance(values, list):
+                    continue
+                projected_multi[name] = [
+                    capture for value in cast(list[object], values) if (capture := _capture_text_record(value)) is not None
+                ]
+            captures["multi"] = projected_multi
+            projected["metaVariables"] = captures
+    return projected
+
+
 def format_matches_as_text(matches: Sequence[Mapping[str, JsonValue]]) -> str:
     output_blocks: list[str] = []
     for match in matches:
@@ -2420,14 +2533,17 @@ def pattern_failure_result(
 
 
 def search_tool_result(results: SearchResults, output_format: OutputFormat) -> CallToolResult:
+    structured = JSON_OBJECT_ADAPTER.validate_python(dict(results), strict=True)
+    results["output_bytes"] = _set_output_bytes(structured)
+    structured["output_bytes"] = results["output_bytes"]
     if output_format == "json":
         return CallToolResult(
-            content=[TextContent(type="text", text=json.dumps(results, separators=(",", ":")))],
-            structured_content=dict(results),
+            content=[TextContent(type="text", text=json.dumps(structured, separators=(",", ":")))],
+            structured_content=structured,
         )
     return CallToolResult(
         content=[TextContent(type="text", text=format_search_results(results))],
-        structured_content=dict(results),
+        structured_content=structured,
     )
 
 
@@ -2469,10 +2585,13 @@ def format_outline_results(results: OutlineResults) -> str:
 
 
 def outline_tool_result(results: OutlineResults, output_format: OutputFormat) -> CallToolResult:
-    text = json.dumps(results, separators=(",", ":")) if output_format == "json" else format_outline_results(results)
+    structured = JSON_OBJECT_ADAPTER.validate_python(dict(results), strict=True)
+    results["output_bytes"] = _set_output_bytes(structured)
+    structured["output_bytes"] = results["output_bytes"]
+    text = json.dumps(structured, separators=(",", ":")) if output_format == "json" else format_outline_results(results)
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
-        structured_content=dict(results),
+        structured_content=structured,
     )
 
 
@@ -3485,7 +3604,7 @@ class AstGrepService:
                 requested_paths = list(project_paths or ())
                 if relative_source not in requested_paths:
                     requested_paths.append(relative_source)
-                modules = self.inspect_oxc_modules(
+                _, modules = self.inspect_oxc_modules(
                     project_folder=str(project),
                     paths=requested_paths,
                     include_globs=include_globs,
@@ -3511,7 +3630,7 @@ class AstGrepService:
         exclude_globs: Sequence[str] | None,
         strict_paths: bool,
         include_dynamic: bool,
-    ) -> list[JavascriptModule]:
+    ) -> tuple[Path, list[JavascriptModule]]:
         helper = self.runtime.oxc_helper
         expected_versions = self.runtime.oxc_versions
         if helper is None or expected_versions is None:
@@ -3536,7 +3655,7 @@ class AstGrepService:
             modules.append(self._oxc_error_module(resolved.relative_to(project).as_posix(), message))
         if not supported_paths:
             modules.sort(key=lambda module: module["file"])
-            return modules
+            return project, modules
         relative_paths = [path.relative_to(project).as_posix() for path in supported_paths]
         request = {
             "project_root": str(project),
@@ -3577,7 +3696,7 @@ class AstGrepService:
             missing = sorted(expected_files - returned_files)
             raise RuntimeError(f"Oxc helper omitted selected modules: {', '.join(missing)}")
         modules.sort(key=lambda module: module["file"])
-        return modules
+        return project, modules
 
     def _search(
         self,
@@ -3603,12 +3722,12 @@ class AstGrepService:
         project = self._resolve_project(project_folder)
         search_paths = self._resolve_paths(project, paths)
         limit = self._result_limit(max_results)
+        has_text_filter = any(value is not None for value in (text_equals, text_starts_with, text_contains))
         arguments = [
             "--inline-rules",
             rule_yaml,
             "--json=stream",
-            "--max-results",
-            str(limit + 1),
+            *([] if has_text_filter else ["--max-results", str(limit + 1)]),
             *(["--include-metadata"] if include_metadata else []),
             *self._glob_arguments(include_globs, exclude_globs),
             "--",
@@ -3846,14 +3965,14 @@ class AstGrepService:
             text_starts_with=text_starts_with,
             text_contains=text_contains,
         )
+        has_text_filter = any(value is not None for value in (text_equals, text_starts_with, text_contains))
         matches, observed_extra = self._run_match_stream(
             "scan",
             [
                 "--inline-rules",
                 rule_yaml,
                 "--json=stream",
-                "--max-results",
-                str(self.runtime.max_results_cap + 1),
+                *([] if has_text_filter else ["--max-results", str(self.runtime.max_results_cap + 1)]),
                 "--stdin",
             ],
             working_directory=self.runtime.working_directory,
@@ -4197,26 +4316,145 @@ def paged_search_results(
     tool_name: str,
     query: Mapping[str, JsonValue],
     max_results: int | None,
+    max_output_bytes: int,
     cursor: str | None,
+    detail: SearchDetail,
     execute: Callable[[int], SearchResults],
 ) -> SearchResults:
     page_size = runtime.default_max_results if max_results is None else max_results
     if not 1 <= page_size <= runtime.max_results_cap:
         raise ValueError(f"max_results must be between 1 and {runtime.max_results_cap}")
+    if not MIN_PAGE_OUTPUT_BYTES <= max_output_bytes <= MAX_STRUCTURED_OUTPUT_BYTES:
+        raise ValueError(f"max_output_bytes must be between {MIN_PAGE_OUTPUT_BYTES} and {MAX_STRUCTURED_OUTPUT_BYTES}")
     digest = query_digest(tool_name, query)
     if cursor is not None:
-        return runtime.cursor_store.next_search_page(
+        page = runtime.cursor_store.next_search_page(
             cursor=cursor,
             query_digest=digest,
             page_size=page_size,
+            max_output_bytes=max_output_bytes,
         )
-    snapshot = execute(runtime.max_results_cap)
-    return runtime.cursor_store.first_search_page(
-        query_digest=digest,
-        matches=snapshot["matches"],
-        page_size=page_size,
-        source_truncated=snapshot["truncated"],
+    else:
+        snapshot = execute(runtime.max_results_cap)
+        projected = [project_search_match(match, detail) for match in snapshot["matches"]]
+        page = runtime.cursor_store.first_search_page(
+            query_digest=digest,
+            matches=projected,
+            page_size=page_size,
+            source_truncated=snapshot["truncated"],
+            max_output_bytes=max_output_bytes,
+        )
+    result = cast(SearchResults, page)
+    structured = JSON_OBJECT_ADAPTER.validate_python(dict(result), strict=True)
+    result["output_bytes"] = _set_output_bytes(structured)
+    if result["output_bytes"] > max_output_bytes:
+        raise ValueError("structured result exceeds max_output_bytes; use a compact detail mode or a smaller max_results")
+    return result
+
+
+def _outline_records(files: Sequence[OutlineFile], detail: OutlineDetail) -> list[JsonObject]:
+    records: list[JsonObject] = []
+
+    def add_symbols(file: str, language: str, nodes: Sequence[object], depth: int) -> None:
+        for node_value in nodes:
+            node = string_object_dict(node_value)
+            if node is None:
+                continue
+            item: JsonObject = {"depth": depth}
+            for key in ("role", "symbolType", "name", "signature", "astKind", "isImport", "isExported"):
+                if key in node:
+                    item[key] = JSON_VALUE_ADAPTER.validate_python(node[key], strict=True)
+            records.append({"file": file, "language": language, "item": item})
+            members = node.get("members")
+            if isinstance(members, list):
+                add_symbols(file, language, cast(list[object], members), depth + 1)
+
+    for file_result in files:
+        if detail == "symbols":
+            add_symbols(file_result["file"], file_result["language"], file_result["items"], 0)
+            continue
+        for item in file_result["items"]:
+            records.append(
+                {
+                    "file": file_result["file"],
+                    "language": file_result["language"],
+                    "item": JSON_OBJECT_ADAPTER.validate_python(item, strict=True),
+                }
+            )
+    return records
+
+
+def paged_outline_results(
+    *,
+    runtime: RuntimeServices,
+    query: Mapping[str, JsonValue],
+    max_results: int | None,
+    max_output_bytes: int,
+    cursor: str | None,
+    detail: OutlineDetail,
+    execute: Callable[[int], OutlineResults],
+) -> OutlineResults:
+    page_size = runtime.default_max_results if max_results is None else max_results
+    if not 1 <= page_size <= runtime.max_results_cap:
+        raise ValueError(f"max_results must be between 1 and {runtime.max_results_cap}")
+    if not MIN_PAGE_OUTPUT_BYTES <= max_output_bytes <= MAX_STRUCTURED_OUTPUT_BYTES:
+        raise ValueError(f"max_output_bytes must be between {MIN_PAGE_OUTPUT_BYTES} and {MAX_STRUCTURED_OUTPUT_BYTES}")
+    digest = query_digest("outline_code", query)
+    if cursor is not None:
+        page = runtime.cursor_store.next_search_page(
+            cursor=cursor,
+            query_digest=digest,
+            page_size=page_size,
+            max_output_bytes=max_output_bytes,
+        )
+    else:
+        snapshot = execute(runtime.max_results_cap)
+        metadata: JsonObject = {
+            "resolved_paths": list(snapshot.get("resolved_paths", [])),
+            "path_errors": [{"path": error["path"], "error": error["error"]} for error in snapshot.get("path_errors", [])],
+        }
+        page = runtime.cursor_store.first_search_page(
+            query_digest=digest,
+            matches=_outline_records(snapshot["files"], detail),
+            page_size=page_size,
+            source_truncated=snapshot["truncated"],
+            metadata=metadata,
+            max_output_bytes=max_output_bytes,
+        )
+    grouped: dict[tuple[str, str], list[JsonObject]] = {}
+    for record in page["matches"]:
+        file = record.get("file")
+        language = record.get("language")
+        item = record.get("item")
+        if not isinstance(file, str) or not isinstance(language, str) or not isinstance(item, dict):
+            raise RuntimeError("outline cursor contains an invalid projected record")
+        grouped.setdefault((file, language), []).append(JSON_OBJECT_ADAPTER.validate_python(item, strict=True))
+    files: list[OutlineFile] = [{"file": file, "language": language, "items": items} for (file, language), items in grouped.items()]
+    metadata_value = page.get("metadata")
+    metadata = metadata_value if isinstance(metadata_value, dict) else {}
+    resolved_value = metadata.get("resolved_paths")
+    resolved_paths = [value for value in resolved_value if isinstance(value, str)] if isinstance(resolved_value, list) else []
+    path_errors_value = metadata.get("path_errors")
+    path_errors = (
+        [cast(OutlinePathError, value) for value in path_errors_value if isinstance(value, dict)]
+        if isinstance(path_errors_value, list)
+        else []
     )
+    result: OutlineResults = {
+        "files": files,
+        "returned": page["returned"],
+        "truncated": page["truncated"],
+        "limit": page["limit"],
+        "next_cursor": page.get("next_cursor"),
+        "snapshot_truncated": page.get("snapshot_truncated", False),
+        "resolved_paths": resolved_paths,
+        "path_errors": path_errors,
+    }
+    structured = JSON_OBJECT_ADAPTER.validate_python(dict(result), strict=True)
+    result["output_bytes"] = _set_output_bytes(structured)
+    if result["output_bytes"] > max_output_bytes:
+        raise ValueError("structured outline exceeds max_output_bytes; use detail='symbols' or a smaller max_results")
+    return result
 
 
 def paged_javascript_module_results(
@@ -4225,7 +4463,7 @@ def paged_javascript_module_results(
     query: Mapping[str, JsonValue],
     max_results: int | None,
     cursor: str | None,
-    execute: Callable[[], list[JavascriptModule]],
+    execute: Callable[[], tuple[Path, list[JavascriptModule]]],
 ) -> JavascriptModuleResults:
     page_size = runtime.default_max_results if max_results is None else max_results
     if not 1 <= page_size <= runtime.max_results_cap:
@@ -4234,12 +4472,8 @@ def paged_javascript_module_results(
     if cursor is not None:
         page = runtime.cursor_store.next_search_page(cursor=cursor, query_digest=digest, page_size=page_size)
     else:
-        modules = execute()
+        project, modules = execute()
         module_records = [JSON_OBJECT_ADAPTER.validate_python(module, strict=True) for module in modules]
-        project_folder = query.get("project_folder")
-        if not isinstance(project_folder, str):
-            raise RuntimeError("Oxc module query has no project folder")
-        project = Path(project_folder).resolve(strict=True)
         source_hasher = hashlib.sha256()
         for module in sorted(modules, key=lambda item: item["file"]):
             source_hasher.update(module["file"].encode("utf-8"))
@@ -4468,24 +4702,64 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             bool,
             Field(description="Retain only public members in member-bearing outline views"),
         ] = False,
+        detail: Annotated[
+            OutlineDetail,
+            Field(description="Full hierarchy records or flattened compact symbol records"),
+        ] = "full",
+        max_output_bytes: Annotated[
+            int,
+            Field(
+                ge=MIN_PAGE_OUTPUT_BYTES,
+                le=MAX_STRUCTURED_OUTPUT_BYTES,
+                description="Maximum UTF-8 bytes in one structured result page",
+            ),
+        ] = DEFAULT_PAGE_OUTPUT_BYTES,
+        cursor: Annotated[
+            str | None,
+            Field(description="Opaque continuation cursor from the previous identical query"),
+        ] = None,
         output_format: Annotated[
             OutputFormat,
             Field(description="Compact text or structured JSON result"),
         ] = "text",
     ) -> Annotated[CallToolResult, OutlineResults]:
-        """Resolve exact files and extract a bounded per-file symbol hierarchy."""
-        results = service.outline_code(
-            project_folder=project_folder,
-            paths=paths,
-            include_globs=include_globs,
-            exclude_globs=exclude_globs,
-            strict_paths=strict_paths,
-            language=language,
-            max_results=max_results,
-            items=items,
-            symbol_types=symbol_types,
-            public_members=public_members,
-        )
+        """Resolve exact files and extract a byte- and count-bounded symbol page."""
+        query: JsonObject = {
+            "project_folder": project_folder,
+            "paths": json_strings(paths),
+            "include_globs": json_strings(include_globs),
+            "exclude_globs": json_strings(exclude_globs),
+            "strict_paths": strict_paths,
+            "language": language,
+            "items": items,
+            "symbol_types": json_strings(symbol_types),
+            "public_members": public_members,
+            "detail": detail,
+            "max_output_bytes": max_output_bytes,
+        }
+        try:
+            results = paged_outline_results(
+                runtime=runtime,
+                query=query,
+                max_results=max_results,
+                max_output_bytes=max_output_bytes,
+                cursor=cursor,
+                detail=detail,
+                execute=lambda snapshot_limit: service.outline_code(
+                    project_folder=project_folder,
+                    paths=paths,
+                    include_globs=include_globs,
+                    exclude_globs=exclude_globs,
+                    strict_paths=strict_paths,
+                    language=language,
+                    max_results=snapshot_limit,
+                    items=items,
+                    symbol_types=symbol_types,
+                    public_members=public_members,
+                ),
+            )
+        except (ValueError, RuntimeError) as error:
+            raise ToolError(str(error)) from error
         return outline_tool_result(results, output_format)
 
     @server.tool(
@@ -4536,6 +4810,18 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
                 ),
             ),
         ] = None,
+        detail: Annotated[
+            SearchDetail,
+            Field(description="Full match records, capture text records, or location-only records"),
+        ] = "full",
+        max_output_bytes: Annotated[
+            int,
+            Field(
+                ge=MIN_PAGE_OUTPUT_BYTES,
+                le=MAX_STRUCTURED_OUTPUT_BYTES,
+                description="Maximum UTF-8 bytes in one structured result page",
+            ),
+        ] = DEFAULT_PAGE_OUTPUT_BYTES,
         cursor: Annotated[
             str | None,
             Field(description="Opaque continuation cursor from the previous identical query"),
@@ -4545,7 +4831,7 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             Field(description="Compact text or structured JSON result"),
         ] = "text",
     ) -> Annotated[CallToolResult, SearchResults]:
-        """Find bounded structural pattern matches inside an allowed project scope."""
+        """Find byte- and count-bounded structural pattern matches inside an allowed project scope."""
         query: JsonObject = {
             "project_folder": project_folder,
             "pattern": pattern,
@@ -4556,6 +4842,8 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             "paths": json_strings(paths),
             "include_globs": json_strings(include_globs),
             "exclude_globs": json_strings(exclude_globs),
+            "detail": detail,
+            "max_output_bytes": max_output_bytes,
         }
         try:
             results = paged_search_results(
@@ -4563,7 +4851,9 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
                 tool_name="find_code",
                 query=query,
                 max_results=max_results,
+                max_output_bytes=max_output_bytes,
                 cursor=cursor,
+                detail=detail,
                 execute=lambda snapshot_limit: service.find_code(
                     project_folder=project_folder,
                     pattern=pattern,
@@ -4648,6 +4938,18 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             str | None,
             Field(description="Keep matches whose complete node text contains this literal"),
         ] = None,
+        detail: Annotated[
+            SearchDetail,
+            Field(description="Full match records, capture text records, or location-only records"),
+        ] = "full",
+        max_output_bytes: Annotated[
+            int,
+            Field(
+                ge=MIN_PAGE_OUTPUT_BYTES,
+                le=MAX_STRUCTURED_OUTPUT_BYTES,
+                description="Maximum UTF-8 bytes in one structured result page",
+            ),
+        ] = DEFAULT_PAGE_OUTPUT_BYTES,
         cursor: Annotated[
             str | None,
             Field(description="Opaque continuation cursor from the previous identical query"),
@@ -4657,7 +4959,7 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             Field(description="Compact text or structured JSON result"),
         ] = "text",
     ) -> Annotated[CallToolResult, SearchResults]:
-        """Find bounded matches for one or more validated ast-grep YAML rules."""
+        """Find byte- and count-bounded matches for one or more validated ast-grep YAML rules."""
         try:
             validate_rule_yaml(yaml, forbid_regex_rules=runtime.forbid_regex_rules)
         except ValueError as error:
@@ -4674,6 +4976,8 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             "text_equals": text_equals,
             "text_starts_with": text_starts_with,
             "text_contains": text_contains,
+            "detail": detail,
+            "max_output_bytes": max_output_bytes,
         }
         page_limit = max_results or runtime.default_max_results
         if cursor is None and positive_code is not None:
@@ -4721,7 +5025,9 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             tool_name="find_code_by_rule",
             query=query,
             max_results=max_results,
+            max_output_bytes=max_output_bytes,
             cursor=cursor,
+            detail=detail,
             execute=lambda snapshot_limit: service.find_code_by_rule(
                 project_folder=project_folder,
                 rule_yaml=yaml,
@@ -4779,6 +5085,18 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             bool,
             Field(description="Run configured rule tests first and skip the scan when they fail"),
         ] = False,
+        detail: Annotated[
+            SearchDetail,
+            Field(description="Full match records, capture text records, or location-only records"),
+        ] = "full",
+        max_output_bytes: Annotated[
+            int,
+            Field(
+                ge=MIN_PAGE_OUTPUT_BYTES,
+                le=MAX_STRUCTURED_OUTPUT_BYTES,
+                description="Maximum UTF-8 bytes in one structured result page",
+            ),
+        ] = DEFAULT_PAGE_OUTPUT_BYTES,
         cursor: Annotated[
             str | None,
             Field(description="Opaque continuation cursor from the previous identical query"),
@@ -4797,6 +5115,8 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             "exclude_globs": json_strings(exclude_globs),
             "include_metadata": include_metadata,
             "run_tests_first": run_tests_first,
+            "detail": detail,
+            "max_output_bytes": max_output_bytes,
         }
         if cursor is None and run_tests_first:
             test_result = service.test_project_rules(rule_ids=rule_ids)
@@ -4819,7 +5139,9 @@ def register_structural_tools(server: FastMCP, runtime: RuntimeServices) -> None
             tool_name="scan_project_rules",
             query=query,
             max_results=max_results,
+            max_output_bytes=max_output_bytes,
             cursor=cursor,
+            detail=detail,
             execute=lambda snapshot_limit: service.scan_project_rules(
                 project_folder=project_folder,
                 rule_ids=rule_ids,
@@ -5011,19 +5333,23 @@ def register_oxc_tools(server: FastMCP, runtime: RuntimeServices) -> None:
             "strict_paths": strict_paths,
             "include_dynamic": include_dynamic,
         }
-        results = paged_javascript_module_results(
-            runtime=runtime,
-            query=query,
-            max_results=max_results,
-            cursor=cursor,
-            execute=lambda: service.inspect_oxc_modules(
+
+        def execute_modules() -> tuple[Path, list[JavascriptModule]]:
+            return service.inspect_oxc_modules(
                 project_folder=project_folder,
                 paths=paths,
                 include_globs=include_globs,
                 exclude_globs=exclude_globs,
                 strict_paths=strict_paths,
                 include_dynamic=include_dynamic,
-            ),
+            )
+
+        results = paged_javascript_module_results(
+            runtime=runtime,
+            query=query,
+            max_results=max_results,
+            cursor=cursor,
+            execute=execute_modules,
         )
         return javascript_module_tool_result(results, output_format)
 
@@ -5439,18 +5765,21 @@ def create_mcp(runtime: RuntimeServices) -> FastMCP:
                 command=runtime.oxc_helper.command_prefix,
                 cwd=str(runtime.working_directory),
                 environment=environment,
+                max_response_bytes=MAX_STRUCTURED_OUTPUT_BYTES,
             )
         if runtime.analysis_helper is not None:
             runtime.analysis_worker = JsonLineWorker(
                 command=runtime.analysis_helper.command_prefix,
                 cwd=str(runtime.working_directory),
                 environment=environment,
+                max_response_bytes=MAX_STRUCTURED_OUTPUT_BYTES,
             )
         if runtime.typescript_project_helper is not None:
             runtime.typescript_project_worker = JsonLineWorker(
                 command=runtime.typescript_project_helper.command_prefix,
                 cwd=str(runtime.working_directory),
                 environment=environment,
+                max_response_bytes=MAX_STRUCTURED_OUTPUT_BYTES,
             )
         try:
             yield {"services": runtime, "cursor_store": runtime.cursor_store}

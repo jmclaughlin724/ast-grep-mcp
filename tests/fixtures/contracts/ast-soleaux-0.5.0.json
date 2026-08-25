@@ -240,6 +240,9 @@
         "items": "auto",
         "symbol_types": null,
         "public_members": false,
+        "detail": "full",
+        "max_output_bytes": 32768,
+        "cursor": null,
         "output_format": "text"
       },
       "output_fields": [
@@ -247,6 +250,9 @@
         "returned",
         "truncated",
         "limit",
+        "next_cursor",
+        "snapshot_truncated",
+        "output_bytes",
         "resolved_paths",
         "path_errors"
       ]
@@ -279,6 +285,8 @@
         "include_globs": null,
         "exclude_globs": null,
         "max_results": null,
+        "detail": "full",
+        "max_output_bytes": 32768,
         "cursor": null,
         "output_format": "text"
       },
@@ -289,6 +297,7 @@
         "limit",
         "next_cursor",
         "snapshot_truncated",
+        "output_bytes",
         "diagnostics"
       ]
     },
@@ -981,11 +990,11 @@
   "generated": {
     "tool_fingerprints": {
       "dump_syntax_tree": "0abf14a60bad15ffc4e66f0d96d0777080121b140328be52ddaab64ec49bcf3e",
-      "find_code": "15edadb4263b432007d31fce25c74ba98225558e5358035e8ac994c45b86052f",
-      "find_code_by_rule": "0d940531d671f646d06e30c9e0cf4df09feb986c06917351bbe77af8289d4c17",
+      "find_code": "faab98af0022a46a444e2fd0ffb757cb136db327a419cc3f92646933d4beac4a",
+      "find_code_by_rule": "0046e150441bc97e23fbde431319eb3b545273482edb35dc9ac9130e971fe6ac",
       "get_server_info": "5f4bd8eca5e98f2a72123c5da67606851e2b6e32da0e21589fda63e664548f25",
       "inspect_typescript_project": "3708966cd6fc326648e3ec5dec7eb933ff813070d8eb5187a3f37e7128ff9c5e",
-      "outline_code": "1330695001d039c9bdc3d09489e685e0361d4977ed5e028dcd4f7307b778ce26",
+      "outline_code": "e300806bbb235ba7528a38abb5f3554451f4815ae6c3e4768d46036a7bcaa5bb",
       "oxc_minify": "1be404671881c77400d922cc09835e149de116d169409524297192f0bee0d6b8",
       "oxc_minify_files": "7f6909adb05a098a88c82bbf9e1ef7cc9cf2ce50bbf10f66750ed5039979fbbf",
       "oxc_modules": "5bd3de8dad43864a12776a7fc6abd9c02aad3e704bca686f4624aa6f2dc6aa07",
@@ -994,7 +1003,7 @@
       "postgres_deparse_preview": "391878f2a57da0b460e095aa89e622ba0333a61a9c0d667f4b3ce4204d2908ff",
       "postgres_parse": "ed3868eacee76abb678686cdc957cb3bc50467587725c658a8b7e4858b7e6b09",
       "postgres_parse_files": "f8433a85127fe443454d3f96bc51e75b885d6e29b119a94562ba6a50859fa856",
-      "scan_project_rules": "5e5e056a7c56c8a52e81465abd37b894af5091a0bc2c519fcdf62bb664075dd4",
+      "scan_project_rules": "7cc64462cbcadf2dbb2abdac72e45e96366677dfd21cf8559e984be78bfa1205",
       "semantic_cfg": "01b06af9fa08c69b0c160bbfe0cb16222b30172406be2a538a6d0647d55284fb",
       "semantic_references": "d2bc36ec8cfe8e14a78b067796fe0a6c116d4d05d99c6fefdd7299408cb288fb",
       "semantic_scopes": "1596c9725e103559f66cb12da5d487b317caae9f177ebfa698c1716226e26b4e",
@@ -1004,13 +1013,13 @@
       "typescript_execute": "2f63f46d5198c9e2f7beb4cbba9299e53e92f024f8b8a8f486309bdeeb5f6464"
     },
     "profile_fingerprints": {
-      "baseline": "677f8b1835631b4701c8fdd0fa0dfcc856d030ecbe899fdabc082f8285bbbe98",
-      "oxc": "585e2ba6a2fb73dfd08c2fd97b179285fa13d66a7280c173a0001075c2a572a5",
-      "semantic": "1084a61d670d9b7af654c9200ad1548b1993fe527a282425d7f036d873ca5012",
-      "configured": "8becfcb6eaa2764f1bd46759e3e5cebafcca622c63b3623f2250787de4cde25e",
-      "typescript_compiler": "796c957072bf8282c1eb1e3e7d1a1f719c9ece6cc711402cbe097a9053c47c19",
-      "postgresql": "4671ca1b735000bf1a8df014dfba8198175f556d3c064f657ec0a415d60310f3",
-      "all": "6e5100c034e681d809f6df3746a8d9d5ebd0a6b975c47c9ed52af3ba12bebffc"
+      "baseline": "91ee7869590733537da3d499b93ab5156a3d697c5565d909693c8ea9ba943a98",
+      "oxc": "8fffed5d291499e2b8306981695e7c080177912ddd95d15ad3d1382f52157c86",
+      "semantic": "ef5f1b9e605f5864b2c48c65828ae9fcdd9542c6d188ccbd07209ce0891d42c0",
+      "configured": "fbd4fb466ff6217c0190f292b4e5952aa758b8fd22cdd457d41d4c63bb5f7137",
+      "typescript_compiler": "8e3003532dd5b66b914ce00365ba3a687cb2b3e479af734f6d5c5c13f7a91e82",
+      "postgresql": "28f644e9f2934dfaa6e1695ba92cb5a31cd5db4fdd4a07c8b6bcde99b28f8e2f",
+      "all": "ee08be8d19b673792dba86b2f342098d037df731d0ff07b014d05962413856cf"
     }
   }
 }

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from ast_soleaux import mutation
 from ast_soleaux.mutation import MutationService, PlannedWrite
 
 
@@ -64,3 +65,30 @@ def test_source_overwrite_requires_explicit_capability(tmp_path: Path) -> None:
             conflict_policy="overwrite",
             allow_source_overwrite=False,
         )
+
+
+def test_failed_batch_removes_targets_created_before_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = tmp_path / "dist" / "first.js"
+    second = tmp_path / "dist" / "second.js"
+    original_replace = mutation.os.replace
+
+    def fail_second_staged_replace(source: str | Path, target: str | Path) -> None:
+        if Path(source).suffix == ".tmp" and Path(target) == second:
+            raise OSError("second replacement failed")
+        original_replace(source, target)
+
+    monkeypatch.setattr(mutation.os, "replace", fail_second_staged_replace)
+    with pytest.raises(OSError, match="second replacement failed"):
+        service().apply(
+            project=tmp_path,
+            writes=[
+                PlannedWrite(source=None, target=first, content="first\n"),
+                PlannedWrite(source=None, target=second, content="second\n"),
+            ],
+            conflict_policy="error",
+            allow_source_overwrite=False,
+        )
+
+    assert first.exists() is False
+    assert second.exists() is False
+    assert list((tmp_path / "dist").glob(".*.tmp")) == []

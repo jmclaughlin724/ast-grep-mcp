@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
 import { after, test } from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -28,28 +29,44 @@ function runSidecar(request, ...argumentsList) {
   });
 }
 
-function runServerRequests(requests) {
+function runServerRequests(requests, afterResponse = () => {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [sidecar, "--serve"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
-    let stdout = "";
+    const responses = [];
     let stderr = "";
+    let failed = false;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => (stdout += chunk));
-    child.stderr.on("data", (chunk) => (stderr += chunk));
-    child.on("error", rejectPromise);
-    child.on("close", (code) => {
-      if (code !== 0) return rejectPromise(new Error(`worker exited ${code}: ${stderr}`));
-      resolvePromise(
-        stdout
-          .trim()
-          .split("\n")
-          .map((line) => JSON.parse(line)),
-      );
+    const lines = createInterface({ input: child.stdout });
+    const reject = (error) => {
+      if (failed) return;
+      failed = true;
+      child.kill();
+      rejectPromise(error);
+    };
+    lines.on("line", (line) => {
+      try {
+        responses.push(JSON.parse(line));
+        afterResponse(responses.length, responses.at(-1));
+        if (responses.length === requests.length) {
+          child.stdin.end();
+        } else {
+          child.stdin.write(`${JSON.stringify(requests[responses.length])}\n`);
+        }
+      } catch (error) {
+        reject(error);
+      }
     });
-    child.stdin.end(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (failed) return;
+      if (code !== 0) return rejectPromise(new Error(`worker exited ${code}: ${stderr}`));
+      resolvePromise(responses);
+    });
+    child.stdin.write(`${JSON.stringify(requests[0])}\n`);
   });
 }
 
@@ -155,6 +172,47 @@ test("persistent worker caches module graphs and recovers from invalid requests"
   assert.equal(responses[1].cache_hit, true);
   assert.match(responses[2].error, /project_root/);
   assert.equal(responses[3].modules[0].file, "entry.js");
+});
+
+test("persistent worker revalidates cached module resolutions", async () => {
+  const root = temporaryProject();
+  const dependency = join(root, "dep.js");
+  writeFileSync(join(root, "package.json"), '{"type":"module"}\n');
+  writeFileSync(join(root, "entry.js"), 'import "./dep.js";\n');
+  writeFileSync(dependency, "export {};\n");
+  const request = { project_root: root, files: ["entry.js"], include_dynamic: false };
+  const responses = await runServerRequests([request, request], (count) => {
+    if (count === 1) rmSync(dependency);
+  });
+  assert.equal(responses[0].modules[0].edges[0].resolution, "resolved");
+  assert.equal(responses[1].cache_hit, false);
+  assert.equal(responses[1].modules[0].edges[0].resolution, "unresolved");
+});
+
+test("ignores shadowed CommonJS globals", () => {
+  const root = temporaryProject();
+  mkdirSync(join(root, "src"));
+  writeFileSync(join(root, "src", "dep.js"), "export {};\n");
+  writeFileSync(
+    join(root, "src", "shadowed.cjs"),
+    [
+      'function load(require) { return require("./dep.js"); }',
+      "function publish(module, exports) {",
+      "  module.exports = {};",
+      "  exports.value = 1;",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  const completed = runSidecar({
+    project_root: root,
+    files: ["src/shadowed.cjs"],
+    include_dynamic: false,
+  });
+  assert.equal(completed.status, 0, completed.stderr);
+  const [module] = JSON.parse(completed.stdout).modules;
+  assert.deepEqual(module.edges, []);
+  assert.deepEqual(module.commonjs_exports, []);
 });
 
 test("rejects the removed formatter operation", () => {

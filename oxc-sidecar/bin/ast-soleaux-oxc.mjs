@@ -352,13 +352,33 @@ function commonJsFacts(sourceText, importer, projectRoot, resolver) {
     true,
     scriptKindFor(importer),
   );
+  const compilerOptions = {
+    allowJs: true,
+    noLib: true,
+    noResolve: true,
+    target: ts.ScriptTarget.Latest,
+  };
+  const host = ts.createCompilerHost(compilerOptions);
+  host.getSourceFile = (fileName) => (fileName === importer ? sourceFile : undefined);
+  host.fileExists = (fileName) => fileName === importer;
+  host.readFile = (fileName) => (fileName === importer ? sourceText : undefined);
+  const checker = ts.createProgram([importer], compilerOptions, host).getTypeChecker();
+  const isUnshadowedGlobal = (identifier, name) => {
+    if (!ts.isIdentifier(identifier) || identifier.text !== name) return false;
+    const symbol = checker.resolveName(name, identifier, ts.SymbolFlags.Value, false);
+    return !symbol?.declarations?.some(
+      (declaration) =>
+        declaration.getSourceFile() === sourceFile &&
+        !ts.isSourceFile(declaration) &&
+        declaration !== identifier,
+    );
+  };
   const edges = [];
   const exports = [];
   const visit = (node) => {
     if (
       ts.isCallExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === "require" &&
+      isUnshadowedGlobal(node.expression, "require") &&
       node.arguments.length === 1 &&
       ts.isStringLiteralLike(node.arguments[0])
     ) {
@@ -380,17 +400,18 @@ function commonJsFacts(sourceText, importer, projectRoot, resolver) {
     }
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
       const left = node.left;
-      if (
+      const assignsModuleExports =
         ts.isPropertyAccessExpression(left) &&
-        ((ts.isIdentifier(left.expression) &&
-          left.expression.text === "module" &&
-          left.name.text === "exports") ||
-          (ts.isIdentifier(left.expression) && left.expression.text === "exports") ||
-          (ts.isPropertyAccessExpression(left.expression) &&
-            ts.isIdentifier(left.expression.expression) &&
-            left.expression.expression.text === "module" &&
-            left.expression.name.text === "exports"))
-      ) {
+        isUnshadowedGlobal(left.expression, "module") &&
+        left.name.text === "exports";
+      const assignsExportsProperty =
+        ts.isPropertyAccessExpression(left) && isUnshadowedGlobal(left.expression, "exports");
+      const assignsModuleExportsProperty =
+        ts.isPropertyAccessExpression(left) &&
+        ts.isPropertyAccessExpression(left.expression) &&
+        isUnshadowedGlobal(left.expression.expression, "module") &&
+        left.expression.name.text === "exports";
+      if (assignsModuleExports || assignsExportsProperty || assignsModuleExportsProperty) {
         exports.push({
           start: left.getStart(sourceFile),
           end: left.getEnd(),
@@ -533,6 +554,40 @@ async function inspectModules(request) {
   return { versions, graph_version: MODULE_GRAPH_VERSION, graph, modules, cache_hit: false };
 }
 
+function clearProjectResolverCaches(projectRoot) {
+  for (const mode of ["import", "require"]) {
+    const resolver = projectResolvers.get(`${projectRoot}\0${mode}`);
+    if (resolver !== undefined) resolver.clearCache();
+  }
+}
+
+function cachedModuleGraphIsCurrent(cached, projectRoot) {
+  const importResolver = resolverForProject(projectRoot, "import");
+  const requireResolver = resolverForProject(projectRoot, "require");
+  const fields = [
+    "resolution",
+    "resolved_path",
+    "package_json_path",
+    "module_type",
+    "resolution_error",
+  ];
+  for (const module of cached.modules) {
+    const importer = resolve(projectRoot, module.file);
+    for (const edge of module.edges) {
+      if (typeof edge.specifier !== "string") continue;
+      const resolver = edge.module_system === "commonjs" ? requireResolver : importResolver;
+      let current;
+      try {
+        current = resolveSpecifier(resolver, importer, edge.specifier, projectRoot);
+      } catch {
+        return false;
+      }
+      if (fields.some((field) => current[field] !== edge[field])) return false;
+    }
+  }
+  return true;
+}
+
 async function inspectModulesCached(request) {
   const projectRoot = await realpath(request.projectRoot);
   const identities = [];
@@ -564,16 +619,14 @@ async function inspectModulesCached(request) {
     configurationIdentities,
     request.includeDynamic,
   ]);
+  clearProjectResolverCaches(projectRoot);
   const cached = moduleCache.get(key);
-  if (cached !== undefined) {
+  if (cached !== undefined && cachedModuleGraphIsCurrent(cached, projectRoot)) {
     moduleCache.delete(key);
     moduleCache.set(key, cached);
     return { ...cached, cache_hit: true };
   }
-  for (const mode of ["import", "require"]) {
-    const resolver = projectResolvers.get(`${projectRoot}\0${mode}`);
-    if (resolver !== undefined) resolver.clearCache();
-  }
+  if (cached !== undefined) moduleCache.delete(key);
   const result = await inspectModules(request);
   moduleCache.set(key, result);
   while (moduleCache.size > MODULE_CACHE_LIMIT) {

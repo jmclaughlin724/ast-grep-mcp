@@ -106,7 +106,7 @@ def terminate_and_reap(
         raise RuntimeError("Command process could not be reaped after termination") from error
 
 
-def _response_queue() -> queue.Queue[str | BaseException | None]:
+def _response_queue() -> queue.Queue[bytes | BaseException | None]:
     return queue.Queue()
 
 
@@ -115,8 +115,10 @@ class JsonLineWorker:
     command: Sequence[str]
     cwd: str
     environment: Mapping[str, str]
-    _process: subprocess.Popen[str] | None = field(default=None, init=False)
-    _responses: queue.Queue[str | BaseException | None] = field(default_factory=_response_queue, init=False)
+    max_response_bytes: int
+    read_chunk_bytes: int = 64 * 1024
+    _process: subprocess.Popen[bytes] | None = field(default=None, init=False)
+    _responses: queue.Queue[bytes | BaseException | None] = field(default_factory=_response_queue, init=False)
     _reader: threading.Thread | None = field(default=None, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
@@ -133,10 +135,9 @@ class JsonLineWorker:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
+            text=False,
             shell=False,
-            bufsize=1,
+            bufsize=0,
             start_new_session=group_options.get("start_new_session") is True,
             creationflags=creationflags,
         )
@@ -149,10 +150,22 @@ class JsonLineWorker:
         if process is None or process.stdout is None:
             self._responses.put(RuntimeError("worker stdout is unavailable"))
             return
+        buffered = bytearray()
         try:
-            for line in process.stdout:
-                self._responses.put(line)
+            while chunk := os.read(process.stdout.fileno(), self.read_chunk_bytes):
+                buffered.extend(chunk)
+                while (newline := buffered.find(b"\n")) >= 0:
+                    if newline > self.max_response_bytes:
+                        raise RuntimeError(f"worker response exceeds {self.max_response_bytes} bytes")
+                    self._responses.put(bytes(buffered[:newline]))
+                    del buffered[: newline + 1]
+                if len(buffered) > self.max_response_bytes:
+                    raise RuntimeError(f"worker response exceeds {self.max_response_bytes} bytes")
+            if buffered:
+                self._responses.put(bytes(buffered))
         except BaseException as error:
+            if process.poll() is None:
+                terminate_and_reap(process)
             self._responses.put(error)
         finally:
             self._responses.put(None)
@@ -165,7 +178,7 @@ class JsonLineWorker:
                 raise RuntimeError("worker stdin is unavailable")
             if process.poll() is not None:
                 raise RuntimeError(f"worker exited with code {process.returncode}")
-            process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
             process.stdin.flush()
             try:
                 response = self._responses.get(timeout=timeout)

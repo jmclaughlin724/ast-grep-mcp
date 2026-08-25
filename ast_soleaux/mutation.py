@@ -98,6 +98,7 @@ class MutationService:
 
         staged: list[tuple[Path, Path]] = []
         backups: list[tuple[Path, Path]] = []
+        created: list[Path] = []
         applied: list[AppliedWrite] = []
         try:
             for _, target, _, output_bytes in normalized:
@@ -119,7 +120,9 @@ class MutationService:
                     shutil.copy2(target, backup)
                     backups.append((target, backup))
                 os.replace(staged_path, target)
-                if backup is not None:
+                if backup is None:
+                    created.append(target)
+                else:
                     shutil.copymode(backup, target)
                 previous_text = previous.decode("utf-8") if previous is not None else ""
                 output_text = output_bytes.decode("utf-8")
@@ -145,6 +148,8 @@ class MutationService:
                     )
                 )
         except BaseException:
+            for target in reversed(created):
+                target.unlink(missing_ok=True)
             for target, backup in reversed(backups):
                 if backup.exists():
                     os.replace(backup, target)

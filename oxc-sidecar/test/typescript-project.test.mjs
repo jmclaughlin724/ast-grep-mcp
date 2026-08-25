@@ -116,7 +116,32 @@ test("rejects source roots outside project", () => {
   assert.match(completed.stderr, /outside project_root/);
 });
 
-test("persistent worker caches identical projects and invalidates on source changes", async () => {
+test("counts modules and nested facts against max_results", () => {
+  const root = project();
+  const completed = run(root, {
+    include_emit: false,
+    include_code_actions: false,
+    max_results: 1,
+  });
+  assert.equal(completed.status, 0, completed.stderr);
+  const result = JSON.parse(completed.stdout);
+  const counted =
+    result.diagnostics.length +
+    result.modules.length +
+    result.modules.reduce(
+      (total, module) => total + module.imports.length + module.exports.length,
+      0,
+    ) +
+    result.symbols.length +
+    result.inferred_types.length +
+    result.emit.length +
+    result.code_actions.length;
+  assert.equal(result.returned, 1);
+  assert.equal(counted, 1);
+  assert.equal(result.truncated, true);
+});
+
+test("persistent worker invalidates when an imported source changes", async () => {
   const root = project();
   const child = spawn(process.execPath, [worker, "--serve"], { stdio: ["pipe", "pipe", "pipe"] });
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -124,6 +149,7 @@ test("persistent worker caches identical projects and invalidates on source chan
   const request = JSON.stringify({
     project_root: root,
     tsconfig: "tsconfig.json",
+    paths: ["src/index.ts"],
     include_emit: false,
   });
 
@@ -135,11 +161,56 @@ test("persistent worker caches identical projects and invalidates on source chan
   assert.equal(second.cache_hit, true);
   assert.equal(first.source_digest, second.source_digest);
 
-  writeFileSync(join(root, "src", "index.ts"), "export const value = 99;\n");
+  writeFileSync(join(root, "src", "a.ts"), 'export const a = "changed";\n');
   child.stdin.write(`${request}\n`);
   const third = JSON.parse((await iterator.next()).value);
   assert.equal(third.cache_hit, false);
   assert.notEqual(third.source_digest, first.source_digest);
+  assert.equal(
+    third.symbols.find((symbol) => symbol.file === "src/index.ts" && symbol.name === "value").type,
+    "string",
+  );
+
+  child.stdin.end();
+  await new Promise((resolve) => child.once("close", resolve));
+  assert.equal(child.exitCode, 0);
+});
+
+test("persistent worker invalidates when a missing import target is created", async () => {
+  const root = project('import { missing } from "./missing.js";\nexport const value = missing;\n');
+  const child = spawn(process.execPath, [worker, "--serve"], { stdio: ["pipe", "pipe", "pipe"] });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+  const request = JSON.stringify({
+    project_root: root,
+    tsconfig: "tsconfig.json",
+    paths: ["src/index.ts"],
+    include_emit: false,
+  });
+
+  child.stdin.write(`${request}\n`);
+  const first = JSON.parse((await iterator.next()).value);
+  child.stdin.write(`${request}\n`);
+  const second = JSON.parse((await iterator.next()).value);
+  assert.equal(
+    first.diagnostics.some((diagnostic) => diagnostic.code === 2307),
+    true,
+  );
+  assert.equal(second.cache_hit, true);
+
+  writeFileSync(join(root, "src", "missing.ts"), "export const missing = 1;\n");
+  child.stdin.write(`${request}\n`);
+  const third = JSON.parse((await iterator.next()).value);
+  const imported = third.modules
+    .find((module) => module.file === "src/index.ts")
+    .imports.find((item) => item.specifier === "./missing.js");
+  assert.equal(third.cache_hit, false);
+  assert.equal(
+    third.diagnostics.some((diagnostic) => diagnostic.code === 2307),
+    false,
+  );
+  assert.equal(imported.resolution, "resolved");
+  assert.equal(imported.resolved_path, "src/missing.ts");
 
   child.stdin.end();
   await new Promise((resolve) => child.once("close", resolve));

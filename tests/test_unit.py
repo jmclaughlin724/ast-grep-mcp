@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ from pytest_mock import MockerFixture
 
 from ast_soleaux.config_snapshot import ConfigSnapshot
 from ast_soleaux.server import (
+    DEFAULT_PAGE_OUTPUT_BYTES,
     JSON_OBJECT_ADAPTER,
     MAX_NATIVE_LIBRARY_BYTES,
     MAX_NDJSON_RECORD_BYTES,
@@ -37,6 +39,7 @@ from ast_soleaux.server import (
     SUPPORTED_OXC_RESOLVER_VERSION,
     WINDOWS_CREATE_PROCESS_LIMIT,
     AstGrepService,
+    JavascriptModule,
     JsonObject,
     JsonValue,
     OutlineResults,
@@ -53,7 +56,10 @@ from ast_soleaux.server import (
     format_outline_results,
     format_search_results,
     outline_tool_result,
+    paged_javascript_module_results,
+    paged_outline_results,
     parse_stream_matches,
+    project_search_match,
     resolve_ast_grep_executable,
     resolve_oxc_helper_executable,
     run_mcp_server,
@@ -61,6 +67,7 @@ from ast_soleaux.server import (
     run_outline_process,
     run_process,
     run_text_process,
+    search_tool_result,
     validate_match_document,
     validate_process_budget,
     validate_rule_yaml,
@@ -1680,6 +1687,39 @@ def test_search_uses_limit_plus_one_globs_and_relative_results(tmp_path: Path) -
     assert command[-1] == str(source.parent)
 
 
+def test_search_literal_filter_counts_only_accepted_matches(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    source = project / "example.py"
+    project.mkdir()
+    source.write_text("print('skip')\nprint('target')\n", encoding="utf-8")
+    matches = [
+        {
+            "file": str(source),
+            "text": text,
+            "range": {"start": {"line": index}, "end": {"line": index}},
+        }
+        for index, text in enumerate(["skip-one", "skip-two", "target"])
+    ]
+    runner = RecordingRunner(stdout="\n".join(json.dumps(match) for match in matches))
+    service = AstGrepService(make_runtime(tmp_path), runner=runner)
+
+    results = service.find_code_by_rule(
+        project_folder="project",
+        rule_yaml="id: print-call\nlanguage: python\nrule:\n  pattern: print($A)\n",
+        paths=["example.py"],
+        include_globs=None,
+        exclude_globs=None,
+        max_results=1,
+        include_metadata=False,
+        text_equals="target",
+    )
+
+    assert [match["text"] for match in results["matches"]] == ["target"]
+    assert results["returned"] == 1
+    assert results["truncated"] is False
+    assert "--max-results" not in runner.calls[0][0]
+
+
 @pytest.mark.parametrize("include_metadata", [False, True])
 def test_rule_search_forwards_metadata_flag_only_when_requested(
     tmp_path: Path,
@@ -2785,6 +2825,158 @@ def test_search_cursor_pages_and_rejects_query_mismatch() -> None:
         store.next_search_page(cursor=cursor, query_digest="query-a", page_size=1)
 
 
+def test_search_projection_field_sets_and_page_output_bytes() -> None:
+    full = json_object(
+        {
+            "file": "src/types.ts",
+            "range": {"start": {"line": 0, "column": 0}, "end": {"line": 0, "column": 20}},
+            "language": "TypeScript",
+            "ruleId": "object-types",
+            "text": "export type Value = { amount: number }",
+            "lines": "export type Value = { amount: number }",
+            "labels": [{"text": "duplicate"}],
+            "metaVariables": {
+                "single": {"T": {"text": "Value", "range": {"start": 12, "end": 17}}},
+                "multi": {"FIELDS": [{"text": "amount: number", "range": {"start": 22, "end": 36}}]},
+                "transformed": {"NORMALIZED": "amount:number"},
+            },
+        }
+    )
+
+    assert project_search_match(full, "full") == full
+    captures = project_search_match(full, "captures")
+    assert set(captures) == {"file", "range", "language", "ruleId", "metaVariables"}
+    assert captures["metaVariables"] == {
+        "single": {"T": {"text": "Value"}},
+        "multi": {"FIELDS": [{"text": "amount: number"}]},
+    }
+    assert captures["range"] == {
+        "start": {"line": 0, "column": 0},
+        "end": {"line": 0, "column": 20},
+    }
+    locations = project_search_match(full, "locations")
+    assert set(locations) == {"file", "range", "language", "ruleId"}
+
+    matches = [
+        project_search_match(
+            json_object(
+                {
+                    **full,
+                    "file": f"src/type-{index}.ts",
+                    "metaVariables": {
+                        "single": {"T": {"text": f"Type{index}"}},
+                        "multi": {"FIELDS": [{"text": "value: number"}]},
+                        "transformed": {},
+                    },
+                }
+            ),
+            "captures",
+        )
+        for index in range(118)
+    ]
+    page = ResultCursorStore().first_search_page(
+        query_digest="captures",
+        matches=matches,
+        page_size=118,
+        source_truncated=False,
+        max_output_bytes=DEFAULT_PAGE_OUTPUT_BYTES,
+    )
+    result = search_tool_result(page, "json")
+    structured = json_object(result.structured_content)
+    encoded = len(json.dumps(structured, separators=(",", ":")).encode())
+    assert structured["returned"] == 118
+    assert structured["output_bytes"] == encoded
+    assert encoded < DEFAULT_PAGE_OUTPUT_BYTES
+
+
+def test_search_byte_pages_reject_oversized_records_and_preserve_cursor_identity() -> None:
+    store = ResultCursorStore()
+    matches = [json_object({"file": f"src/{index}.ts", "text": "x" * 700}) for index in range(4)]
+    first = store.first_search_page(
+        query_digest="bounded",
+        matches=matches,
+        page_size=4,
+        source_truncated=False,
+        max_output_bytes=2500,
+    )
+    cursor = first.get("next_cursor")
+    assert isinstance(cursor, str)
+    with pytest.raises(ValueError, match="does not match"):
+        store.next_search_page(
+            cursor=cursor,
+            query_digest="changed",
+            page_size=4,
+            max_output_bytes=2500,
+        )
+    second = store.next_search_page(
+        cursor=cursor,
+        query_digest="bounded",
+        page_size=4,
+        max_output_bytes=2500,
+    )
+    assert [item["file"] for item in [*first["matches"], *second["matches"]]] == [
+        "src/0.ts",
+        "src/1.ts",
+        "src/2.ts",
+        "src/3.ts",
+    ]
+
+    with pytest.raises(ValueError, match="one result record exceeds"):
+        ResultCursorStore().first_search_page(
+            query_digest="oversized",
+            matches=[json_object({"text": "x" * DEFAULT_PAGE_OUTPUT_BYTES})],
+            page_size=1,
+            source_truncated=False,
+            max_output_bytes=DEFAULT_PAGE_OUTPUT_BYTES,
+        )
+
+
+def test_outline_cursor_pages_compact_symbols(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    snapshot: OutlineResults = {
+        "files": [
+            {
+                "file": "src/types.ts",
+                "language": "TypeScript",
+                "items": [
+                    json_object({"name": name, "symbolType": "struct", "signature": f"type {name} = {{}}"}) for name in ("A", "B", "C")
+                ],
+            }
+        ],
+        "returned": 3,
+        "truncated": False,
+        "limit": 500,
+        "resolved_paths": ["src/types.ts"],
+        "path_errors": [],
+    }
+    query = json_object({"project_folder": str(tmp_path), "detail": "symbols", "max_output_bytes": 5200})
+    first = paged_outline_results(
+        runtime=runtime,
+        query=query,
+        max_results=2,
+        max_output_bytes=5200,
+        cursor=None,
+        detail="symbols",
+        execute=lambda _limit: snapshot,
+    )
+    cursor = first.get("next_cursor")
+    assert isinstance(cursor, str)
+    second = paged_outline_results(
+        runtime=runtime,
+        query=query,
+        max_results=2,
+        max_output_bytes=5200,
+        cursor=cursor,
+        detail="symbols",
+        execute=lambda _limit: pytest.fail("cursor continuation must reuse the retained snapshot"),
+    )
+    names = [item["name"] for result in (first, second) for file_result in result["files"] for item in file_result["items"]]
+    assert names == ["A", "B", "C"]
+    assert first["output_bytes"] <= 5200
+    assert second["output_bytes"] <= 5200
+    runtime.close()
+
+
 @pytest.mark.asyncio
 async def test_unconfigured_fastmcp_catalog_hides_project_rule_tools(tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
@@ -2858,7 +3050,7 @@ def test_oxc_module_inspection_normalizes_contained_paths_and_request(tmp_path: 
     runtime = make_runtime(tmp_path, with_oxc=True)
     service = AstGrepService(runtime, runner=runner)
 
-    modules = service.inspect_oxc_modules(
+    _, modules = service.inspect_oxc_modules(
         project_folder=str(tmp_path),
         paths=["src/entry.ts"],
         include_globs=None,
@@ -2878,6 +3070,59 @@ def test_oxc_module_inspection_normalizes_contained_paths_and_request(tmp_path: 
         "files": ["src/entry.ts"],
         "include_dynamic": True,
     }
+
+
+def test_oxc_module_pagination_uses_service_resolved_project(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    source = project / "entry.js"
+    project.mkdir()
+    source.write_text("export {};\n", encoding="utf-8")
+    server_directory = tmp_path / "server"
+    server_directory.mkdir()
+    module: JavascriptModule = {
+        "file": "entry.js",
+        "has_module_syntax": True,
+        "source_type": "module",
+        "package": None,
+        "commonjs_exports": [],
+        "import_meta_spans": [],
+        "edges": [],
+        "diagnostics": [],
+    }
+    response = {
+        "versions": {
+            "helper": SUPPORTED_OXC_HELPER_VERSION,
+            "parser": SUPPORTED_OXC_PARSER_VERSION,
+            "resolver": SUPPORTED_OXC_RESOLVER_VERSION,
+        },
+        "graph_version": 1,
+        "graph": {"version": 1, "nodes": [], "edges": []},
+        "cache_hit": False,
+        "modules": [module],
+    }
+    runtime = replace(make_runtime(tmp_path, with_oxc=True), working_directory=server_directory)
+    service = AstGrepService(runtime, runner=RecordingRunner(stdout=json.dumps(response)))
+
+    results = paged_javascript_module_results(
+        runtime=runtime,
+        query={"project_folder": "project"},
+        max_results=1,
+        cursor=None,
+        execute=lambda: service.inspect_oxc_modules(
+            project_folder="project",
+            paths=["entry.js"],
+            include_globs=None,
+            exclude_globs=None,
+            strict_paths=True,
+            include_dynamic=False,
+        ),
+    )
+
+    source_hasher = hashlib.sha256()
+    source_hasher.update(b"entry.js")
+    source_hasher.update(source.read_bytes())
+    assert results["modules"] == [module]
+    assert results["source_digest"] == source_hasher.hexdigest()
 
 
 def test_oxc_module_inspection_rejects_sidecar_paths_outside_project(tmp_path: Path) -> None:

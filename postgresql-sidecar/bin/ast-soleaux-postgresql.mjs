@@ -61,7 +61,7 @@ function rejectUnknownKeys(value, allowed, label) {
 }
 
 function boundedMessage(value) {
-  const text = Error.isError(value) ? value.message : String(value);
+  const text = value instanceof Error ? value.message : String(value);
   return text.length <= MAX_MESSAGE_CHARACTERS ? text : `${text.slice(0, MAX_MESSAGE_CHARACTERS)}…`;
 }
 

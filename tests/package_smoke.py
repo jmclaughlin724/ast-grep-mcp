@@ -118,6 +118,8 @@ def _check_sdist(sdist: Path, expected_version: str) -> None:
             f"{expected_root}/analysis-sidecar/src/main.rs",
             f"{expected_root}/analysis-sidecar/tests/protocol.rs",
             f"{expected_root}/execution-sidecar/ast_soleaux_typescript_sandbox.py",
+            f"{expected_root}/execution-sidecar/package-lock.json",
+            f"{expected_root}/execution-sidecar/package.json",
             f"{expected_root}/postgresql-sidecar/bin/ast-soleaux-postgresql.mjs",
             f"{expected_root}/postgresql-sidecar/package-lock.json",
             f"{expected_root}/postgresql-sidecar/package.json",

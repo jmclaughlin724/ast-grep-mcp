@@ -22,6 +22,7 @@ from mcp.types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 from pydantic import TypeAdapter
 
 from ast_soleaux.server import (
+    DEFAULT_PAGE_OUTPUT_BYTES,
     HARD_MAX_RESULTS,
     JSON_OBJECT_ADAPTER,
     MAX_NDJSON_RECORD_BYTES,
@@ -666,6 +667,60 @@ def test_pattern_search_is_bounded_and_project_relative(ast_grep_executable: str
     assert result["limit"] == 1
     assert result["matches"][0]["file"] == "example.py"
     assert "def hello" in _string(result["matches"][0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_capture_projection_bounds_118_object_aliases(
+    tmp_path: Path,
+    ast_grep_executable: str,
+) -> None:
+    source = tmp_path / "types.ts"
+    source.write_text(
+        "\n".join(f"export type Type{index} = {{ value{index}: number }}" for index in range(118)),
+        encoding="utf-8",
+    )
+    service = actual_service(tmp_path, ast_grep_executable)
+    try:
+        async with FastMCPClient(create_mcp(service.runtime)) as client:
+            result = await client.call_tool(
+                "find_code",
+                {
+                    "project_folder": str(tmp_path),
+                    "pattern": "export type $T = { $$$FIELDS }",
+                    "language": "typescript",
+                    "paths": ["types.ts"],
+                    "detail": "captures",
+                    "max_results": 118,
+                    "max_output_bytes": DEFAULT_PAGE_OUTPUT_BYTES,
+                    "output_format": "json",
+                },
+            )
+        assert result.is_error is False
+        payload = _object(result.structured_content)
+        assert _integer(payload["returned"]) == 118
+        assert _integer(payload["output_bytes"]) < DEFAULT_PAGE_OUTPUT_BYTES
+        assert payload.get("next_cursor") is None
+        for match_value in _list(payload["matches"]):
+            match = _object(match_value)
+            assert set(match) == {"file", "range", "language", "ruleId", "metaVariables"}
+    finally:
+        service.runtime.close()
+
+
+def test_multi_document_yaml_finds_21_rules_in_one_probe(
+    ast_grep_executable: str,
+) -> None:
+    service = actual_service(REPOSITORY_ROOT, ast_grep_executable)
+    try:
+        names = [f"Type{index}" for index in range(21)]
+        code = "\n".join(f"type {name} = {{ value: number }}" for name in names)
+        documents = "\n---\n".join(
+            f"id: type-{index}\nlanguage: TypeScript\nrule:\n  pattern: type {name} = {{ $$$FIELDS }}" for index, name in enumerate(names)
+        )
+        matches = service.test_match_code_rule(code=code, rule_yaml=documents)
+        assert {match["ruleId"] for match in matches} == {f"type-{index}" for index in range(21)}
+    finally:
+        service.runtime.close()
 
 
 def test_rule_search_honors_include_and_exclude_globs(

@@ -73,6 +73,7 @@ jobs:
     - name: Install and test Oxc sidecar
       run: |
         npm ci --prefix oxc-sidecar
+        npm ci --prefix execution-sidecar
         node oxc-sidecar/bin/ast-soleaux-oxc.mjs --version
         node oxc-sidecar/bin/ast-soleaux-typescript-project.mjs --version-json
         uv run --no-sync python execution-sidecar/ast_soleaux_typescript_sandbox.py --version-json

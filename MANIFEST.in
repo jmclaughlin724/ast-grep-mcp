@@ -7,6 +7,8 @@ recursive-include .codex/rules *.rules
 recursive-include .claude/rules *.md
 recursive-include scripts *.py
 recursive-include ast_soleaux *.py
+include execution-sidecar/package.json
+include execution-sidecar/package-lock.json
 recursive-include execution-sidecar *.py
 include analysis-sidecar/Cargo.toml
 include analysis-sidecar/Cargo.lock

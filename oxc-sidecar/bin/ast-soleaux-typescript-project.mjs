@@ -275,15 +275,36 @@ function inspect(rawRequest) {
     dirname(new URL(import.meta.resolve("typescript/package.json")).pathname),
   );
   const configPath = checkedRelativeFile(projectRoot, request.tsconfig, "tsconfig");
-  const readConfig = ts.readConfigFile(configPath, (path) =>
-    safeReadFile(path, projectRoot, typescriptRoot),
-  );
+  const effectiveInputPaths = new Set();
+  const missingResolutionPaths = new Set();
+  const trackMissingResolutionPath = (path) => {
+    const candidate = resolve(path);
+    if (isWithin(candidate, projectRoot) || isWithin(candidate, typescriptRoot)) {
+      missingResolutionPaths.add(candidate);
+    }
+  };
+  const trackedReadFile = (path) => {
+    const text = safeReadFile(path, projectRoot, typescriptRoot);
+    if (text !== undefined) effectiveInputPaths.add(realpathSync(path));
+    return text;
+  };
+  const trackedFileExists = (path) => {
+    const exists = safeFileExists(path, projectRoot, typescriptRoot);
+    if (!exists) trackMissingResolutionPath(path);
+    return exists;
+  };
+  const trackedDirectoryExists = (path) => {
+    const exists = safeDirectoryExists(path, projectRoot, typescriptRoot);
+    if (!exists) trackMissingResolutionPath(path);
+    return exists;
+  };
+  const readConfig = ts.readConfigFile(configPath, trackedReadFile);
   if (readConfig.error)
     throw new Error(ts.flattenDiagnosticMessageText(readConfig.error.messageText, "\n"));
   const parseHost = {
     useCaseSensitiveFileNames: ts.sys.useCaseSensitiveFileNames,
-    fileExists: (path) => safeFileExists(path, projectRoot, typescriptRoot),
-    readFile: (path) => safeReadFile(path, projectRoot, typescriptRoot),
+    fileExists: trackedFileExists,
+    readFile: trackedReadFile,
     readDirectory: (root, extensions, excludes, includes, depth) =>
       isWithin(resolve(root), projectRoot)
         ? ts.sys.readDirectory(root, extensions, excludes, includes, depth)
@@ -308,11 +329,11 @@ function inspect(rawRequest) {
   const baseHost = ts.createCompilerHost(options, true);
   const host = {
     ...baseHost,
-    fileExists: (path) => safeFileExists(path, projectRoot, typescriptRoot),
-    readFile: (path) => safeReadFile(path, projectRoot, typescriptRoot),
-    directoryExists: (path) => safeDirectoryExists(path, projectRoot, typescriptRoot),
+    fileExists: trackedFileExists,
+    readFile: trackedReadFile,
+    directoryExists: trackedDirectoryExists,
     getSourceFile: (path, languageVersion, onError) => {
-      const text = safeReadFile(path, projectRoot, typescriptRoot);
+      const text = trackedReadFile(path);
       if (text === undefined) {
         onError?.(`read denied or unavailable: ${path}`);
         return undefined;
@@ -361,18 +382,21 @@ function inspect(rawRequest) {
   for (const diagnostic of allDiagnostics)
     add(diagnostics, diagnosticValue(diagnostic, projectRoot));
   for (const sourceFile of sourceFiles) {
-    modules.push({
+    const module = {
       file: repositoryPath(sourceFile.fileName, projectRoot),
-      imports: moduleFacts(sourceFile, options, host, projectRoot, add),
-      exports: (() => {
-        const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
-        return moduleSymbol
-          ? checker
-              .getExportsOfModule(moduleSymbol)
-              .map((symbol) => ({ name: symbol.getName(), flags: symbol.flags }))
-          : [];
-      })(),
-    });
+      imports: [],
+      exports: [],
+    };
+    if (!add(modules, module)) break;
+    module.imports = moduleFacts(sourceFile, options, host, projectRoot, add);
+    if (truncated) break;
+    const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+    if (moduleSymbol) {
+      for (const symbol of checker.getExportsOfModule(moduleSymbol)) {
+        if (!add(module.exports, { name: symbol.getName(), flags: symbol.flags })) break;
+      }
+    }
+    if (truncated) break;
     for (const statement of sourceFile.statements) {
       const name = declarationName(statement);
       if (!name) continue;
@@ -412,15 +436,15 @@ function inspect(rawRequest) {
       getScriptFileNames: () => sourceFiles.map((sourceFile) => sourceFile.fileName),
       getScriptVersion: () => "0",
       getScriptSnapshot: (path) => {
-        const text = safeReadFile(path, projectRoot, typescriptRoot);
+        const text = trackedReadFile(path);
         return text === undefined ? undefined : ts.ScriptSnapshot.fromString(text);
       },
       getCurrentDirectory: () => projectRoot,
       getDefaultLibFileName: (compilerOptions) => ts.getDefaultLibFilePath(compilerOptions),
-      fileExists: (path) => safeFileExists(path, projectRoot, typescriptRoot),
-      readFile: (path) => safeReadFile(path, projectRoot, typescriptRoot),
+      fileExists: trackedFileExists,
+      readFile: trackedReadFile,
       readDirectory: parseHost.readDirectory,
-      directoryExists: (path) => safeDirectoryExists(path, projectRoot, typescriptRoot),
+      directoryExists: trackedDirectoryExists,
     };
     const languageService = ts.createLanguageService(languageHost, ts.createDocumentRegistry());
     try {
@@ -469,23 +493,33 @@ function inspect(rawRequest) {
     digest.update(sourceFile.text);
     digest.update("\0");
   }
+  for (const sourceFile of program.getSourceFiles()) {
+    if (existsSync(sourceFile.fileName)) effectiveInputPaths.add(realpathSync(sourceFile.fileName));
+  }
+  const inputIdentities = [...effectiveInputPaths]
+    .sort()
+    .map((path) => [path, crypto.createHash("sha256").update(readFileSync(path)).digest("hex")]);
   return {
-    typescript_version: ts.version,
-    tsconfig: repositoryPath(configPath, projectRoot),
-    root_files: uniqueRoots
-      .map((file) => repositoryPath(file, projectRoot))
-      .filter((item) => item !== null),
-    options,
-    diagnostics,
-    modules,
-    symbols,
-    inferred_types: inferredTypes,
-    emit: emitted,
-    code_actions: codeActions,
-    source_digest: digest.digest("hex"),
-    returned,
-    truncated,
-    limit: request.maxResults,
+    result: {
+      typescript_version: ts.version,
+      tsconfig: repositoryPath(configPath, projectRoot),
+      root_files: uniqueRoots
+        .map((file) => repositoryPath(file, projectRoot))
+        .filter((item) => item !== null),
+      options,
+      diagnostics,
+      modules,
+      symbols,
+      inferred_types: inferredTypes,
+      emit: emitted,
+      code_actions: codeActions,
+      source_digest: digest.digest("hex"),
+      returned,
+      truncated,
+      limit: request.maxResults,
+    },
+    inputIdentities,
+    missingResolutionPaths: [...missingResolutionPaths].sort(),
   };
 }
 
@@ -526,16 +560,42 @@ function requestIdentity(rawRequest) {
   return digest.digest("hex");
 }
 
+function inputIdentitiesAreCurrent(inputIdentities) {
+  for (const [path, expectedDigest] of inputIdentities) {
+    try {
+      const digest = crypto.createHash("sha256").update(readFileSync(path)).digest("hex");
+      if (digest !== expectedDigest) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function missingResolutionPathsAreCurrent(paths) {
+  return paths.every((path) => !existsSync(path));
+}
+
 function cachedInspect(rawRequest) {
   const key = requestIdentity(rawRequest);
   const cached = projectCache.get(key);
-  if (cached !== undefined) {
+  if (
+    cached !== undefined &&
+    inputIdentitiesAreCurrent(cached.inputIdentities) &&
+    missingResolutionPathsAreCurrent(cached.missingResolutionPaths)
+  ) {
     projectCache.delete(key);
     projectCache.set(key, cached);
-    return { ...cached, cache_hit: true };
+    return { ...cached.result, cache_hit: true };
   }
-  const result = { ...inspect(rawRequest), cache_hit: false };
-  projectCache.set(key, result);
+  if (cached !== undefined) projectCache.delete(key);
+  const inspected = inspect(rawRequest);
+  const result = { ...inspected.result, cache_hit: false };
+  projectCache.set(key, {
+    result,
+    inputIdentities: inspected.inputIdentities,
+    missingResolutionPaths: inspected.missingResolutionPaths,
+  });
   while (projectCache.size > MAX_CACHE_ENTRIES)
     projectCache.delete(projectCache.keys().next().value);
   return result;
